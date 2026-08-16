@@ -1,0 +1,1767 @@
+/* 玻璃卡片风格悬浮窗；与 yunxiao-status-widget 视觉语言保持一致 */
+
+:root {
+  /* 关键：告诉 Chromium 用暗色渲染**原生控件**。
+     下拉框展开的 popup 由操作系统绘制，不受 .option 的 CSS 完全控制——
+     缺这一行时 Windows 会用亮色 popup 配我们的浅色文字，内容看不见。 */
+  color-scheme: dark;
+
+  --bg: rgba(22, 26, 34, 0.9);
+  --bg-solid: #161a22;
+  --border: rgba(255, 255, 255, 0.09);
+  --text: #e8ecf3;
+  --text-dim: #9aa4b2;
+  --text-faint: rgba(255, 255, 255, 0.38);
+  --up: #f5475f;
+  --down: #12b886;
+  --flat: #9aa4b2;
+  --avg: #f0b429;
+  --accent: #4c8dff;
+  --hover: rgba(255, 255, 255, 0.06);
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html,
+body {
+  height: 100%;
+  background: transparent;
+  overflow: hidden;
+  font-family: 'Segoe UI', 'Microsoft YaHei', sans-serif;
+  color: var(--text);
+  font-size: 12px;
+  -webkit-user-select: none;
+  user-select: none;
+  cursor: default;
+}
+
+.drag {
+  -webkit-app-region: drag;
+}
+.no-drag {
+  -webkit-app-region: no-drag;
+}
+.hidden {
+  display: none !important;
+}
+
+.card {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  background: var(--bg);
+  backdrop-filter: blur(18px);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  overflow: hidden;
+}
+
+/* —— 折叠模式 ——
+   折叠时整窗高 40px（见 src/windowLayout.js 的 COLLAPSED_H），
+   只留 .collapsed-bar 一行。.collapsible 是展开态才显示的区块，
+   加一个类就能整批隐藏，不必逐个 id 操作。 */
+
+.card.is-collapsed .collapsible {
+  display: none;
+}
+/* 折叠态没有滚动内容，圆角也要小一点才像一个「条」而非「窗」 */
+.card.is-collapsed {
+  border-radius: 8px;
+}
+
+/* gap 从 8 收到 6、右侧留 8px：四个按钮进来后 300px（MIN_W）下要挤。
+   右 padding 与展开态 .head 的 8px 一致，退出键在折叠前后不会横向跳 */
+.collapsed-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: 100%;
+  padding: 0 8px 0 10px;
+}
+
+/* 与展开态 .head-actions 同一套间距，两态切换时按钮组不变形 */
+.collapsed-actions {
+  display: flex;
+  gap: 2px;
+  flex-shrink: 0;
+}
+
+.collapsed-pick {
+  display: flex;
+  align-items: baseline;
+  min-width: 0;
+  padding: 2px 4px;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 5px;
+  color: var(--text);
+  font: inherit;
+  cursor: pointer;
+}
+.collapsed-pick:hover {
+  background: var(--hover);
+  border-color: var(--border);
+}
+/* 名称：max-width 是上限而非固定宽。窗口被拉窄时（最小 300px，见 MIN_W）
+   加上缩略图会放不下，此时由 flex 压缩 .collapsed-pick（它有 min-width:0），
+   这里的 ellipsis 才生效。名称截断不丢信息——完整名称在 .collapsed-bar 的 tooltip 里。 */
+.collapsed-name {
+  font-size: 13px;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 118px;
+}
+
+/* 价格与涨跌幅：等宽数字，避免每次刷新宽度跳动带动整行抖 */
+/* flex-shrink:0：宁可截断名称也不能压价格。数字被切掉半位没法读，
+   而名称省略号是可预期的 */
+.collapsed-price {
+  flex: 0 0 auto;
+  font-size: 17px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+}
+/* flex:1 留在涨跌幅上：多余空间落在涨跌幅与缩略图之间，
+   缩略图因此始终贴着展开按钮，不随价格位数变化左右漂 */
+.collapsed-pct {
+  flex: 1;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+/* 分时缩略图：理想 62px，挤的时候可以收到 34px（窗口拉到 MIN_W=300 且
+   四个按钮都在时会走到这一步），再窄就不如不显示了。
+   高度写死不参与收缩——24px 是 40px 条里的舒适值，压扁就看不出形状。
+
+   Canvas 的 CSS 尺寸决定 drawSparkline 里的坐标系，宽度变了必须重画，
+   否则位图被拉伸会发虚，见 renderer.js 的 resize 处理。 */
+.collapsed-spark {
+  flex: 0 1 62px;
+  min-width: 34px;
+  height: 24px;
+}
+
+/* —— 列表模式（多股同屏）——
+
+   窗口高度由主进程按行数算死（见 src/windowLayout.js 的 listHeight），
+   所以这里的行高必须与那边的 LIST_ROW_H 保持一致：偏小会在底部留一条空白，
+   偏大会让最后一行被裁掉。同理 .list-view 的表头空间对应 LIST_HEAD_H。
+
+   .card.is-list 下 .collapsible 仍然显示（那个类是给折叠态用的），
+   所以要在这里显式把展开态的区块藏掉——只留 head 与列表本身。 */
+
+.card.is-list .collapsible {
+  display: none;
+}
+
+.list-view {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  padding: 2px 4px 4px;
+}
+
+/* flex:1 + min-height:0 是这里能滚的前提（flex 子项默认 min-height:auto，
+   缺那一行会被内容撑开而不产生滚动条，溢出部分被 .card 的 overflow:hidden 裁掉）。
+
+   两种情况都靠它消化：
+     行数超过 LIST_MAX_ROWS(14) 时自动高度被截断
+     用户手动把窗口拖得比内容矮（列表模式可缩放，见 resizableForMode）
+   下面的 .list-summary 是 flex-shrink:0，压缩时它不让位——持仓合计
+   比多看一行更重要 */
+.list-rows {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+.list-rows::-webkit-scrollbar {
+  width: 6px;
+}
+.list-rows::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.16);
+  border-radius: 3px;
+}
+.list-rows::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* 行高 26px 与 windowLayout.LIST_ROW_H 是同一份约定。
+   用 height 而非 min-height：高度必须可预测，否则窗口算出来的高度对不上内容 */
+.list-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: 26px;
+  padding: 0 6px;
+  border-radius: 4px;
+}
+.list-row.is-clickable {
+  cursor: pointer;
+}
+.list-row.is-clickable:hover {
+  background: var(--hover);
+}
+.list-row.active {
+  background: rgba(76, 141, 255, 0.16);
+}
+
+/* 名称吃掉剩余空间并在挤不下时省略。min-width:0 是 flex 里 ellipsis 生效的前提 */
+.list-name {
+  flex: 1;
+  min-width: 0;
+  font-size: 12px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* 价格与涨跌幅：flex-shrink:0 —— 宁可截断名称也不能压数字。
+   数字被切掉半位没法读，名称省略号是可预期的（完整名称在 title 里）。
+   与 .collapsed-price 同一套理由。
+   定宽让各行的数字纵向对齐，读起来像一张表而不是一堆散字 */
+.list-price {
+  flex: 0 0 58px;
+  text-align: right;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+.list-pct {
+  flex: 0 0 52px;
+  text-align: right;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* 持仓徽标：在名称之后、价格之前，出现与消失都不推动右侧数字 */
+.list-hold {
+  flex: 0 0 auto;
+  font-size: 9px;
+  font-variant-numeric: tabular-nums;
+  opacity: 0.95;
+}
+
+/* 有徽标时名称能用的空间变小。给一个上限而非依赖 flex：
+   340px 下「名称 + 徽标 + 价格 + 涨跌幅」四项相加会把名称压到只剩几个字，
+   限死上限后省略号出现得更早，但至少不会挤成一列竖排 */
+.list-row.has-hold .list-name {
+  max-width: 120px;
+}
+
+/* 拿不到行情：错误文字占据价格与涨跌幅那片区域 */
+.list-error {
+  flex: 0 0 auto;
+  font-size: 10px;
+  color: var(--text-faint);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 110px;
+}
+
+.list-empty {
+  padding: 16px 12px;
+  text-align: center;
+  font-size: 11px;
+  color: var(--text-dim);
+}
+
+/* 持仓合计：与列表用分隔线隔开，不可点击 */
+.list-summary {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  flex-shrink: 0;
+  margin-top: 2px;
+  padding: 4px 6px 0;
+  border-top: 1px solid var(--border);
+  font-size: 10px;
+  cursor: default;
+}
+.list-summary-label {
+  flex: 1;
+  color: var(--text-dim);
+}
+.list-summary-profit {
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+.list-summary-pct {
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* —— 顶部 —— */
+
+.head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  padding: 8px 8px 6px 10px;
+  border-bottom: 1px solid var(--border);
+}
+
+/* ◀ picker ▶ 一组，min-width:0 让 picker-name 的 ellipsis 在窗口拉窄时仍生效 */
+.picker-group {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  min-width: 0;
+}
+
+.picker {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  padding: 2px 6px;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 5px;
+  color: var(--text);
+  font: inherit;
+  cursor: pointer;
+  min-width: 0;
+}
+.picker:hover {
+  background: var(--hover);
+  border-color: var(--border);
+}
+.picker-name {
+  font-size: 14px;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 130px;
+}
+.picker-code {
+  font-size: 10px;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+}
+.caret {
+  font-size: 9px;
+  color: var(--text-dim);
+}
+
+.head-actions {
+  display: flex;
+  gap: 2px;
+  flex-shrink: 0;
+}
+
+.icon-btn {
+  width: 22px;
+  height: 22px;
+  display: grid;
+  place-items: center;
+  background: transparent;
+  border: none;
+  border-radius: 5px;
+  color: var(--text-dim);
+  font-size: 13px;
+  line-height: 1;
+  cursor: pointer;
+}
+.icon-btn:hover {
+  background: var(--hover);
+  color: var(--text);
+}
+
+/* —— 关注列表下拉 —— */
+
+.watch-panel {
+  position: absolute;
+  top: 38px;
+  left: 8px;
+  right: 8px;
+  z-index: 20;
+  max-height: 240px;
+  overflow-y: auto;
+  background: var(--bg-solid);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+  padding: 4px;
+}
+
+.watch-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 6px 8px;
+  border-radius: 5px;
+  cursor: pointer;
+}
+.watch-item:hover {
+  background: var(--hover);
+}
+.watch-item.active {
+  background: rgba(76, 141, 255, 0.16);
+}
+.watch-item-left {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+.watch-item-name {
+  font-size: 12px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.watch-item-code {
+  font-size: 9px;
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+}
+.watch-item-right {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  flex-shrink: 0;
+}
+.watch-item-price {
+  font-size: 12px;
+}
+.watch-item-pct {
+  font-size: 10px;
+}
+/* 持仓盈亏徽标：跟在代码下方，字号比代码略大以便区分 */
+.watch-item-hold {
+  font-size: 9px;
+  font-variant-numeric: tabular-nums;
+  opacity: 0.95;
+}
+
+/* 持仓合计行：与上方列表用分隔线隔开，不可点击 */
+.watch-summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: 4px;
+  padding: 5px 8px 2px;
+  border-top: 1px solid var(--border);
+  font-size: 10px;
+  cursor: default;
+}
+.watch-summary-label {
+  color: var(--text-dim);
+}
+.watch-summary-right {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  font-variant-numeric: tabular-nums;
+}
+.watch-summary-profit {
+  font-size: 11px;
+}
+.watch-summary-pct {
+  font-size: 10px;
+}
+
+/* —— 行情数字 —— */
+
+.quote {
+  padding: 8px 10px 6px;
+}
+
+.price-row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.price {
+  font-size: 26px;
+  font-weight: 600;
+  line-height: 1.1;
+  font-variant-numeric: tabular-nums;
+}
+.change {
+  display: flex;
+  gap: 6px;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.up {
+  color: var(--up);
+}
+.down {
+  color: var(--down);
+}
+.flat {
+  color: var(--flat);
+}
+
+.meta-row {
+  display: flex;
+  gap: 10px;
+  margin-top: 4px;
+  font-size: 10px;
+  color: var(--text-dim);
+  white-space: nowrap;
+  overflow: hidden;
+}
+.meta-row b {
+  color: var(--text);
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+}
+
+/* —— 持仓盈亏 —— */
+
+/* 与上方 meta-row 用分隔线隔开：持仓是用户自己的数据，
+   和接口给的行情不是一类，视觉上分开避免混读 */
+.pos-box {
+  margin-top: 5px;
+  padding-top: 5px;
+  border-top: 1px solid var(--border);
+}
+.pos-row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-size: 10px;
+  color: var(--text-dim);
+  white-space: nowrap;
+  overflow: hidden;
+}
+.pos-row + .pos-row {
+  margin-top: 3px;
+}
+.pos-label {
+  flex-shrink: 0;
+}
+.pos-cost {
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* 盈亏比例右对齐到行尾，与上方涨跌幅的位置呼应 */
+.pos-pct {
+  margin-left: auto;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  flex-shrink: 0;
+}
+.pos-profit {
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+.pos-value {
+  margin-left: auto;
+  font-variant-numeric: tabular-nums;
+  flex-shrink: 0;
+}
+
+/* —— 区块标题条 —— */
+
+.section-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 10px 4px;
+  border-top: 1px solid var(--border);
+}
+.section-title {
+  font-size: 10px;
+  color: var(--text-dim);
+  letter-spacing: 0.5px;
+}
+.section-hint {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 10px;
+  color: var(--text-faint);
+}
+
+.chip {
+  padding: 1px 6px;
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text-dim);
+  font: inherit;
+  font-size: 9px;
+  cursor: pointer;
+}
+.chip:hover {
+  background: var(--hover);
+  color: var(--text);
+}
+.chip.on {
+  background: rgba(76, 141, 255, 0.18);
+  border-color: rgba(76, 141, 255, 0.4);
+  color: #a9c8ff;
+}
+
+/* —— 周期切换标签 —— */
+
+.tabs {
+  display: flex;
+  gap: 2px;
+}
+.tab {
+  padding: 1px 7px;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  color: var(--text-dim);
+  font: inherit;
+  font-size: 10px;
+  cursor: pointer;
+}
+.tab:hover {
+  background: var(--hover);
+  color: var(--text);
+}
+.tab.active {
+  background: rgba(76, 141, 255, 0.18);
+  border-color: rgba(76, 141, 255, 0.4);
+  color: #a9c8ff;
+}
+
+/* —— 走势图 —— */
+
+.chart-box {
+  position: relative;
+  flex-shrink: 0;
+}
+.chart {
+  display: block;
+  width: 100%;
+  height: 120px;
+}
+.chart-empty {
+  position: absolute;
+  inset: 24px 0 0;
+  display: grid;
+  place-items: center;
+  font-size: 10px;
+  color: var(--text-faint);
+}
+
+/* 均线图例：K 线视图下贴在图底部 */
+.ma-legend {
+  display: flex;
+  gap: 8px;
+  padding: 0 10px 3px;
+  font-size: 9px;
+  color: var(--text-faint);
+}
+.ma-legend b {
+  font-weight: 600;
+}
+
+/* —— 可滚动区（分组 + 资讯）——
+
+   .card 里唯一吸收剩余空间的区块。窗口高度会随分组开合自动调整
+   （见 renderer.js 的 syncWindowHeight），但五个分组全部展开需要约 1500px，
+   超过多数屏幕的工作区高度，所以这里仍要能滚。
+
+   min-height: 0 是必须的：flex 子项的默认 min-height 是 auto，
+   缺这一行时它会被内容撑开而不产生滚动条，溢出的部分被 .card 的
+   overflow:hidden 裁掉（状态栏就看不见了）。 */
+
+.scroll-area {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+/* 分组按内容占高，不参与压缩 —— 被压扁的分组内容会互相重叠 */
+.scroll-area > .group {
+  flex-shrink: 0;
+}
+
+/* 滚动条：细窄半透明，别在 340px 宽的窗口里抢视觉 */
+.scroll-area::-webkit-scrollbar,
+.news-list::-webkit-scrollbar {
+  width: 6px;
+}
+.scroll-area::-webkit-scrollbar-thumb,
+.news-list::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.16);
+  border-radius: 3px;
+}
+.scroll-area::-webkit-scrollbar-track,
+.news-list::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* —— 新闻 —— */
+
+.news-box {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  /* 新闻区可以被压缩，但不能压到看不见 —— 留出约 4 条的高度。
+     自动调高按 NEWS_TARGET_H(145) 给它算空间，这个下限只在
+     窗口被截断（内容超出工作区）时才起作用 */
+  min-height: 90px;
+}
+.news-list {
+  flex: 1;
+  overflow-y: auto;
+  padding: 0 4px 4px;
+}
+
+.news-date {
+  padding: 5px 6px 2px;
+  font-size: 9px;
+  color: var(--text-faint);
+  position: sticky;
+  top: 0;
+  background: var(--bg-solid);
+}
+.news-date.today {
+  color: var(--accent);
+}
+
+.news-item {
+  display: flex;
+  gap: 6px;
+  padding: 4px 6px;
+  border-radius: 4px;
+  cursor: pointer;
+  line-height: 1.35;
+}
+.news-item:hover {
+  background: var(--hover);
+}
+.news-time {
+  flex-shrink: 0;
+  font-size: 9px;
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+  padding-top: 1px;
+}
+.news-title {
+  font-size: 11px;
+  color: var(--text);
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.news-tag {
+  flex-shrink: 0;
+  align-self: flex-start;
+  margin-top: 1px;
+  padding: 0 3px;
+  font-size: 8px;
+  border-radius: 3px;
+  background: rgba(240, 180, 41, 0.16);
+  color: var(--avg);
+}
+/* 合并列表里研报行借用评级配色（.rep-rating，定义见「研报」小节），
+   这里补上与 .news-tag 一致的布局属性，让它在 flex 行里不被压扁 */
+.news-item .rep-rating {
+  flex-shrink: 0;
+  align-self: flex-start;
+  margin-top: 1px;
+}
+
+.empty,
+.error-box {
+  padding: 16px 12px;
+  text-align: center;
+  font-size: 11px;
+  color: var(--text-dim);
+  line-height: 1.6;
+}
+.error-box {
+  color: var(--up);
+}
+
+/* —— 状态条 —— */
+
+.status {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px 5px;
+  border-top: 1px solid var(--border);
+  font-size: 9px;
+  color: var(--text-faint);
+}
+.phase {
+  flex-shrink: 0;
+  padding: 0 4px;
+  border-radius: 3px;
+  background: var(--hover);
+}
+.phase.live {
+  background: rgba(18, 186, 134, 0.18);
+  color: #4fd1a5;
+}
+.status-msg {
+  flex: 1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--up);
+}
+.updated {
+  flex-shrink: 0;
+  font-variant-numeric: tabular-nums;
+}
+
+/* —— 设置面板 —— */
+
+.settings {
+  position: absolute;
+  inset: 0;
+  z-index: 50;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-solid);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+}
+
+.settings-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 8px 8px 12px;
+  border-bottom: 1px solid var(--border);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.settings-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+.field-row {
+  display: flex;
+  gap: 10px;
+}
+.field-row .field {
+  flex: 1;
+}
+
+.field > label {
+  font-size: 10px;
+  color: var(--text-dim);
+}
+.hint {
+  color: var(--text-faint);
+  font-size: 9px;
+}
+
+input[type='text'],
+select {
+  width: 100%;
+  padding: 5px 7px;
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  color: var(--text);
+  font: inherit;
+  font-size: 11px;
+  outline: none;
+}
+input[type='text']:focus,
+select:focus {
+  border-color: rgba(76, 141, 255, 0.5);
+}
+
+/* 下拉选项：popup 是原生绘制的，背景必须给**不透明**色。
+   用 var(--bg) 那种半透明值会被系统底色透上来，仍然发白。 */
+select option {
+  background-color: var(--bg-solid);
+  color: var(--text);
+}
+select option:checked {
+  background-color: rgba(76, 141, 255, 0.28);
+}
+input[type='range'] {
+  width: 100%;
+  accent-color: var(--accent);
+}
+
+.search-results {
+  display: flex;
+  flex-direction: column;
+  max-height: 130px;
+  overflow-y: auto;
+}
+.search-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 6px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 11px;
+}
+.search-item:hover {
+  background: var(--hover);
+}
+.search-item-code {
+  color: var(--text-faint);
+  font-size: 9px;
+  font-variant-numeric: tabular-nums;
+}
+.search-item.added {
+  opacity: 0.45;
+  cursor: default;
+}
+/* 基金/指数标签：搜索结果与关注列表共用 */
+.search-item-kind {
+  flex: none;
+  padding: 0 3px;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  color: var(--text-faint);
+  font-size: 9px;
+  line-height: 13px;
+}
+
+.watch-editor {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-height: 150px;
+  overflow-y: auto;
+}
+.watch-row {
+  display: flex;
+  align-items: center;
+  /* 持仓输入行要换到第二行：340px 宽放不下名称+代码+两个输入框 */
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 4px 6px;
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid transparent;
+  border-radius: 5px;
+  font-size: 11px;
+}
+.watch-row.dragging {
+  opacity: 0.4;
+}
+.watch-row.drop-target {
+  border-color: rgba(76, 141, 255, 0.5);
+}
+.watch-grip {
+  color: var(--text-faint);
+  cursor: grab;
+  font-size: 10px;
+}
+.watch-row-name {
+  flex: 1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.watch-row-code {
+  color: var(--text-faint);
+  font-size: 9px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* 持仓成本/数量输入：占满整行第二排 */
+.watch-hold-row {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  /* flex-basis 100% 强制换行，不管上一行还剩多少空间 */
+  flex: 0 0 100%;
+}
+.watch-hold-input {
+  /* 覆盖 input[type=text] 的 width:100%，两格等分 */
+  width: auto !important;
+  flex: 1;
+  min-width: 0;
+  padding: 3px 5px !important;
+  font-size: 10px !important;
+  font-variant-numeric: tabular-nums;
+}
+.watch-hold-x {
+  color: var(--text-faint);
+  font-size: 10px;
+  flex-shrink: 0;
+}
+.watch-remove {
+  width: 18px;
+  height: 18px;
+  display: grid;
+  place-items: center;
+  background: transparent;
+  border: none;
+  border-radius: 4px;
+  color: var(--text-faint);
+  cursor: pointer;
+  font-size: 11px;
+}
+.watch-remove:hover {
+  background: rgba(245, 71, 95, 0.18);
+  color: var(--up);
+}
+
+.check {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--text-dim);
+  cursor: pointer;
+}
+.check input {
+  accent-color: var(--accent);
+}
+
+.settings-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 12px;
+  border-top: 1px solid var(--border);
+}
+.settings-msg {
+  font-size: 10px;
+  color: var(--text-dim);
+  flex: 1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.primary {
+  padding: 5px 14px;
+  background: var(--accent);
+  border: none;
+  border-radius: 5px;
+  color: #fff;
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
+}
+.primary:hover {
+  background: #5b98ff;
+}
+
+/* 滚动条 */
+::-webkit-scrollbar {
+  width: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.12);
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.2);
+}
+
+/* ============ 可折叠分组（技术指标 / 资金流向） ============
+   与整窗折叠（.card.is-collapsed）无关：那个收整个窗口，这个收单个分组。
+   两者可以叠加 —— 整窗折叠时 .collapsible 已经把分组一起藏了。 */
+
+.group-bar {
+  cursor: pointer;
+  user-select: none;
+}
+.group-bar:hover {
+  background: var(--hover);
+}
+/* 键盘聚焦要看得见：这一条是 tabindex 的配套，删了就只有鼠标能用 */
+.group-bar:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: -1px;
+}
+.group-caret {
+  display: inline-block;
+  width: 9px;
+  margin-right: 3px;
+  color: var(--text-faint);
+  transition: transform 0.12s ease;
+}
+.group.is-open .group-caret {
+  transform: rotate(90deg);
+}
+.group-body {
+  padding: 2px 10px 8px;
+}
+
+/* ============ 技术指标网格 ============ */
+
+/*
+ * 单列：每个指标是「一行数值 + 一张趋势子图」的堆叠，
+ * 双列时子图只有约 150px 宽，60 根 K 挤成一团分不出形态。
+ */
+.ind-grid {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 2px 10px;
+}
+/* 一行 = 指标名 + 三个数值。BOLL 占满整行（数值更宽） */
+.ind-row {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  min-width: 0;
+}
+.ind-row.wide {
+  grid-column: 1 / -1;
+}
+.ind-name {
+  flex: 0 0 34px;
+  font-size: 10px;
+  color: var(--text-dim);
+  letter-spacing: 0.3px;
+}
+.ind-vals {
+  display: flex;
+  gap: 7px;
+  min-width: 0;
+  font-variant-numeric: tabular-nums;
+  font-size: 11px;
+}
+.ind-val {
+  white-space: nowrap;
+}
+.ind-val .k {
+  color: var(--text-faint);
+  margin-right: 2px;
+}
+.ind-val .v {
+  color: var(--text);
+}
+/* 多空着色沿用行情的红涨绿跌，避免同一窗口两套语义 */
+.ind-val.is-up .v {
+  color: var(--up);
+}
+.ind-val.is-down .v {
+  color: var(--down);
+}
+/* 超买超卖：用底色而非文字色，跟涨跌色区分开 */
+.ind-val.is-hot {
+  background: rgba(245, 71, 95, 0.16);
+  border-radius: 3px;
+  padding: 0 3px;
+}
+.ind-val.is-cold {
+  background: rgba(18, 184, 134, 0.16);
+  border-radius: 3px;
+  padding: 0 3px;
+}
+
+/* —— 指标趋势子图 —— */
+
+/*
+ * 高度写在容器上而不是 canvas 上：canvas 的 width/height 属性由 JS 按 DPR 设，
+ * CSS 里再写一遍会打架。容器定高 + canvas 撑满，尺寸只有一个来源。
+ */
+.ind-chart {
+  height: 46px;
+  margin: 1px 0 5px;
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  border-radius: 3px;
+  background: rgba(255, 255, 255, 0.015);
+}
+.ind-chart:last-child {
+  margin-bottom: 0;
+}
+.ind-canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+/* ============ 资金流向 ============ */
+
+.flow-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 3px 8px;
+  margin-bottom: 6px;
+}
+.flow-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+.flow-label {
+  font-size: 9px;
+  color: var(--text-faint);
+  white-space: nowrap;
+}
+.flow-amount {
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.flow-amount.is-up {
+  color: var(--up);
+}
+.flow-amount.is-down {
+  color: var(--down);
+}
+.flow-amount.is-flat {
+  color: var(--flat);
+}
+
+/* 近 N 日主力净额迷你条：正负分别向上/向下，共享一条基线 */
+.flow-bars {
+  display: flex;
+  align-items: stretch;
+  gap: 3px;
+  height: 34px;
+}
+.flow-bar {
+  flex: 1 1 0;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+.flow-bar-half {
+  flex: 1 1 50%;
+  display: flex;
+  min-width: 0;
+}
+/* 上半格的条从基线往上长，所以竖向反排 */
+.flow-bar-half.top {
+  align-items: flex-end;
+}
+.flow-bar-fill {
+  width: 100%;
+  border-radius: 1px;
+  min-height: 0;
+}
+.flow-bar-fill.is-up {
+  background: var(--up);
+}
+.flow-bar-fill.is-down {
+  background: var(--down);
+}
+.flow-bar-date {
+  font-size: 8px;
+  color: var(--text-faint);
+  text-align: center;
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+/* 空态与错误：跟新闻列表的空态观感一致 */
+.group-empty {
+  padding: 8px 0;
+  font-size: 10px;
+  color: var(--text-faint);
+  text-align: center;
+}
+
+/* ============ 价格预警（设置面板）============ */
+
+.rule-editor {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  max-height: 120px;
+  overflow-y: auto;
+}
+
+/* 一行：股票名 + 条件 + 标记 + 启用 chip + 删除。
+   340px 下靠 min-width:0 与 ellipsis 让名称先让位 */
+.rule-row {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 0;
+  font-size: 10px;
+  border-top: 1px solid var(--border);
+}
+.rule-row:first-child {
+  border-top: none;
+}
+/* 停用的规则整行压暗——它还在列表里但不会触发，视觉上要能区分 */
+.rule-row.is-off {
+  opacity: 0.5;
+}
+.rule-name {
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 74px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.rule-label {
+  flex: 1;
+  min-width: 0;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* 「不在关注列表」标记。用中性色而非警告色——它不是错误，
+   只是暂时不生效（股票加回来即恢复） */
+.rule-tag {
+  flex: 0 0 auto;
+  padding: 0 3px;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  color: var(--text-faint);
+  font-size: 8px;
+  line-height: 13px;
+}
+.rule-toggle {
+  flex: 0 0 auto;
+  font-size: 8px !important;
+  padding: 0 4px;
+}
+
+/* 四格输入 + 添加。三个下拉挤在一起，阈值输入框吃掉剩余空间 */
+.rule-add-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-top: 4px;
+}
+.rule-add-row select {
+  width: auto !important;
+  min-width: 0;
+  padding: 3px 2px !important;
+  font-size: 10px !important;
+}
+#ruleCode {
+  flex: 1.2;
+}
+#ruleKind {
+  flex: 1;
+}
+#ruleDir {
+  flex: 0 0 34px;
+}
+.rule-add-row input {
+  width: auto !important;
+  flex: 0 1 56px;
+  min-width: 0;
+  padding: 3px 5px !important;
+  font-size: 10px !important;
+  font-variant-numeric: tabular-nums;
+}
+#btnAddRule {
+  flex: 0 0 auto;
+  padding: 2px 7px;
+  font-size: 11px;
+}
+
+/* 测试通知 / 重置记录：并排两个小按钮 */
+.rule-actions {
+  display: flex;
+  gap: 6px;
+  margin-top: 4px;
+}
+
+/* 「列表高度是手动设的 + 恢复自动」一行。只在真的拖过时显示 */
+#listSizeRow {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+#listSizeRow.hidden {
+  display: none !important;
+}
+
+/* ============ 交易流水 ============ */
+
+/* 已实现盈亏行：紧跟在持仓（浮动盈亏）下面，用分隔线隔开 ——
+   一个是还没卖的账面盈亏、一个是已经落袋的，混在一起会看错 */
+.realized-row {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  margin-top: 5px;
+  padding-top: 5px;
+  border-top: 1px solid var(--border);
+  font-size: 10px;
+  color: var(--text-dim);
+}
+.realized-label {
+  flex-shrink: 0;
+}
+.realized-value {
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+/* 两个区间 chip 靠右，与上面几行的右对齐数字呼应 */
+.realized-chip {
+  margin-left: auto;
+}
+.realized-chip + .realized-chip {
+  margin-left: 0;
+}
+
+.trade-list {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+/* 卖出多于持仓的警告。问题出在整串流水的关系上，所以摆在列表顶部 */
+.trade-warn {
+  padding: 3px 0 5px;
+  font-size: 9px;
+  color: var(--avg);
+}
+
+/* 一行：日期 + 方向 + 成交 + 已实现 + 删除。
+   等宽数字让各行的价格纵向对齐，读起来像一张表 */
+.trade-row,
+.trade-edit-row {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  padding: 3px 0;
+  font-size: 10px;
+  border-top: 1px solid var(--border);
+}
+.trade-row:first-child,
+.trade-edit-row:first-child {
+  border-top: none;
+}
+.trade-date {
+  flex: 0 0 34px;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+}
+/* 方向用色块而非纯文字：一列里扫过去比读字快。
+   买用涨色、卖用跌色 —— 与「红涨绿跌」同一套语义（买入推价、卖出压价） */
+.trade-side {
+  flex: 0 0 auto;
+  padding: 0 3px;
+  border-radius: 3px;
+  font-size: 9px;
+}
+.trade-side.is-buy {
+  background: rgba(245, 71, 95, 0.16);
+  color: var(--up);
+}
+.trade-side.is-sell {
+  background: rgba(18, 184, 134, 0.16);
+  color: var(--down);
+}
+.trade-deal {
+  flex: 1;
+  min-width: 0;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.trade-realized {
+  flex: 0 0 auto;
+  font-variant-numeric: tabular-nums;
+}
+.trade-remove {
+  flex: 0 0 auto;
+  width: 16px;
+  height: 16px;
+  display: grid;
+  place-items: center;
+  background: transparent;
+  border: none;
+  border-radius: 3px;
+  color: var(--text-faint);
+  cursor: pointer;
+  font-size: 10px;
+}
+.trade-remove:hover {
+  background: rgba(245, 71, 95, 0.18);
+  color: var(--up);
+}
+
+/* —— 设置面板里的流水编辑 —— */
+
+.trade-editor {
+  display: flex;
+  flex-direction: column;
+  max-height: 130px;
+  overflow-y: auto;
+}
+
+/* 四格输入 + 添加按钮。340px 下只能这么排：
+   日期占一半，方向/价格/数量挤在后面 */
+.trade-add-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-top: 4px;
+}
+.trade-add-row input {
+  /* 覆盖 input[type=text] 的 width:100% */
+  width: auto !important;
+  flex: 1;
+  min-width: 0;
+  padding: 3px 5px !important;
+  font-size: 10px !important;
+  font-variant-numeric: tabular-nums;
+}
+/* 日期最长（YYYY-MM-DD），给它多一点 */
+#tradeDate {
+  flex: 1.4;
+}
+.trade-add-row select {
+  width: auto !important;
+  flex: 0 0 42px;
+  padding: 3px 2px !important;
+  font-size: 10px !important;
+}
+#btnAddTrade {
+  flex: 0 0 auto;
+  padding: 2px 7px;
+  font-size: 11px;
+}
+
+/* ============ 财务指标 ============ */
+
+/* 报告期抬头：不写清是哪一期，下面的数字就没有意义 */
+.fin-period {
+  font-size: 10px;
+  color: var(--accent);
+  margin-bottom: 4px;
+}
+.fin-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 3px 8px;
+  margin-bottom: 5px;
+}
+.fin-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+.fin-label {
+  font-size: 9px;
+  color: var(--text-faint);
+  white-space: nowrap;
+}
+.fin-value {
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+/* 营收/净利润：金额位数多，单独占行，标签与同比左右分开 */
+.fin-money {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  padding: 2px 0;
+  border-top: 1px solid var(--border);
+}
+.fin-money .fin-label {
+  flex: 0 0 auto;
+}
+.fin-money .fin-value {
+  flex: 1 1 auto;
+}
+.fin-yoy {
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.fin-yoy.is-up {
+  color: var(--up);
+}
+.fin-yoy.is-down {
+  color: var(--down);
+}
+.fin-yoy.is-flat {
+  color: var(--flat);
+}
+/* 往期 EPS 对照：横向排开，挤不下时允许换行 */
+.fin-hist {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 8px;
+  padding-top: 4px;
+  border-top: 1px solid var(--border);
+}
+.fin-hist-item {
+  font-size: 10px;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+/* ============ 龙虎榜 ============ */
+
+.lhb-list {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+/* 最近一次上榜距今很久时的提示，避免把陈年记录当成刚发生的事 */
+.lhb-stale {
+  font-size: 9px;
+  color: var(--text-faint);
+  padding-bottom: 2px;
+}
+.lhb-item {
+  padding: 4px 0;
+  border-top: 1px solid var(--border);
+}
+.lhb-item:first-child {
+  border-top: none;
+}
+.lhb-head {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+}
+.lhb-date {
+  font-size: 10px;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.lhb-pct,
+.lhb-net {
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.lhb-net {
+  margin-left: auto;
+}
+.lhb-pct.is-up,
+.lhb-net.is-up {
+  color: var(--up);
+}
+.lhb-pct.is-down,
+.lhb-net.is-down {
+  color: var(--down);
+}
+.lhb-pct.is-flat,
+.lhb-net.is-flat {
+  color: var(--flat);
+}
+/* 上榜原因可能很长，截断而不换行——列表要保持每条等高 */
+.lhb-reason {
+  font-size: 10px;
+  color: var(--text);
+  margin-top: 2px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.lhb-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px 8px;
+  margin-top: 2px;
+  font-size: 9px;
+  color: var(--text-faint);
+}
+.lhb-meta .is-up {
+  color: var(--up);
+}
+.lhb-meta .is-down {
+  color: var(--down);
+}
+
+/* ============ 研报 ============ */
+
+/* 评级分布：单条研报的评级没参考价值，分布才有 */
+.rep-summary {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 6px;
+  padding-bottom: 5px;
+  margin-bottom: 3px;
+  border-bottom: 1px solid var(--border);
+}
+/*
+  评级配色刻意不用涨跌色（--up/--down）：评级不是涨跌，
+  借用行情配色会让「买入」看着像已经在涨。正向用蓝、负向用灰紫。
+*/
+.rep-rating {
+  font-size: 9px;
+  padding: 1px 5px;
+  border-radius: 3px;
+  white-space: nowrap;
+  background: var(--hover);
+  color: var(--text-dim);
+}
+.rep-rating.is-pos {
+  background: rgba(76, 141, 255, 0.16);
+  color: var(--accent);
+}
+.rep-rating.is-neg {
+  background: rgba(154, 164, 178, 0.16);
+  color: var(--text-dim);
+}
+.rep-total {
+  font-size: 9px;
+  color: var(--text-faint);
+  margin-left: auto;
+}
+.rep-item {
+  padding: 4px 0;
+  border-top: 1px solid var(--border);
+}
+.rep-item:first-child {
+  border-top: none;
+}
+.rep-item.is-clickable {
+  cursor: pointer;
+}
+.rep-item.is-clickable:hover {
+  background: var(--hover);
+}
+.rep-head {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+}
+.rep-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px 8px;
+  margin-top: 2px;
+  padding-left: 34px; /* 与标题左缘对齐，让机构名不顶到日期下方 */
+  font-size: 9px;
+  color: var(--text-faint);
+}

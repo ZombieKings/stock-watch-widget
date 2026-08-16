@@ -1,0 +1,470 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self'; script-src 'self'" />
+    <title>股票行情</title>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <div class="card">
+      <!--
+        折叠态：整张卡片只显示这一行（名称 + 价格 + 涨跌幅 + 展开按钮）。
+        与展开态的 header 是两套独立 DOM，而不是把 header 改造成两用——
+        展开态的 picker 要能弹下拉、要留刷新/设置/退出三个按钮，
+        塞进 40px 一行里会挤成一团。
+      -->
+      <div id="collapsedBar" class="collapsed-bar drag hidden">
+        <!-- 折叠态放不下下拉面板（窗口仅 40px 高），点名称轮换到下一只 -->
+        <button id="collapsedPicker" class="collapsed-pick no-drag" type="button" title="点击切换到下一只">
+          <span id="cName" class="collapsed-name">--</span>
+        </button>
+        <span id="cPrice" class="collapsed-price">--</span>
+        <span id="cPct" class="collapsed-pct">--</span>
+        <!--
+          分时缩略图。无分时数据（休市、基金停牌、加载失败）时整个画布隐藏，
+          留白比画一个空框子干净。宽度固定，见 .collapsed-spark。
+        -->
+        <canvas id="cSpark" class="collapsed-spark hidden" width="62" height="24"></canvas>
+        <!--
+          与展开态 .head-actions 同一组按钮、同一顺序，只是把 ▲ 换成 ▼。
+          没有复用那三个按钮：它们在 header 里，而 header 与折叠条是互斥显示的
+          两套 DOM（见上方注释），要共用就得把整个布局改成单行两用。
+          故这里另起 id，事件绑到同一批 handler 上。
+        -->
+        <div class="collapsed-actions no-drag">
+          <button id="btnExpand" class="icon-btn" type="button" title="展开（双击标题栏亦可）">▼</button>
+          <button id="btnRefreshC" class="icon-btn" type="button" title="刷新">↻</button>
+          <button id="btnSettingsC" class="icon-btn" type="button" title="设置">⚙</button>
+          <button id="btnCloseC" class="icon-btn" type="button" title="退出">✕</button>
+        </div>
+      </div>
+
+      <!-- 顶部：股票选择 + 操作 -->
+      <header id="head" class="head drag">
+        <!-- ◀▶ 与滚轮都直接在关注列表里前后移一位，不弹下拉——
+             比每次点开面板选目标股票快，鼠标不用离开标题栏。
+             包一层 picker-group 是因为 .head 用 space-between 分两大块，
+             ◀▶ 若与 picker 平级会被 space-between 拉散到两侧 -->
+        <div class="picker-group no-drag">
+          <button id="btnPrevStock" class="icon-btn" type="button" title="上一只（也可在名称上滚动切换）">◀</button>
+          <button id="picker" class="picker" type="button" aria-haspopup="listbox" aria-expanded="false">
+            <span id="pickerName" class="picker-name">未选择</span>
+            <span id="pickerCode" class="picker-code"></span>
+            <span class="caret" aria-hidden="true">▾</span>
+          </button>
+          <button id="btnNextStock" class="icon-btn" type="button" title="下一只（也可在名称上滚动切换）">▶</button>
+        </div>
+        <div class="head-actions no-drag">
+          <!-- 轮换到下一个模式（完整 → 列表 → 单行）。双击标题栏与 Ctrl+M 等效 -->
+          <button id="btnCollapse" class="icon-btn" type="button" title="切换模式：列表 / 单行（双击标题栏或 Ctrl+M 亦可）">▲</button>
+          <button id="btnRefresh" class="icon-btn" type="button" title="刷新">↻</button>
+          <button id="btnSettings" class="icon-btn" type="button" title="设置">⚙</button>
+          <button id="btnClose" class="icon-btn" type="button" title="退出">✕</button>
+        </div>
+      </header>
+
+      <!-- 关注列表下拉。折叠态也要能用，故放在 collapsible 之外 -->
+      <div id="watchPanel" class="watch-panel hidden" role="listbox" aria-label="关注列表"></div>
+
+      <!--
+        列表模式（多股同屏）：每行一只，名称 + 现价 + 涨跌幅（+ 持仓徽标）。
+        点某行切到该股的展开详情，这是本模式的主要出口。
+
+        与展开态的详情区、折叠态的单行条是三套互斥 DOM。没有复用关注列表下拉
+        （watchPanel）那套结构：那个是浮层（position:absolute + 阴影 + 圆角），
+        要盖在详情上；这里是窗口的**全部**内容，且窗口高度按行数定死，
+        两者的布局约束正好相反。
+
+        放在 collapsible 之外：那个类是「展开态才显示」，而本区块恰恰是
+        展开态**不**显示的。显隐由 applyMode 直接切 hidden。
+      -->
+      <div id="listView" class="list-view hidden" role="listbox" aria-label="多股列表">
+        <div id="listRows" class="list-rows"></div>
+        <!-- 持仓合计。无持仓时 renderListSummary 会加 hidden，不占高度 -->
+        <div id="listSummary" class="list-summary hidden"></div>
+      </div>
+
+      <!-- 行情数字 -->
+      <section class="quote collapsible" id="quoteBox">
+        <div class="price-row">
+          <span id="price" class="price">--</span>
+          <span id="changeBox" class="change">
+            <span id="change">--</span>
+            <span id="changePct">--</span>
+          </span>
+        </div>
+        <div class="meta-row">
+          <span>开 <b id="open">--</b></span>
+          <span>昨 <b id="prevClose">--</b></span>
+          <span>高 <b id="high">--</b></span>
+          <span>低 <b id="low">--</b></span>
+        </div>
+        <div class="meta-row">
+          <span>量 <b id="volume">--</b></span>
+          <span>额 <b id="amount">--</b></span>
+          <span>换 <b id="turnover">--</b></span>
+          <span>比 <b id="volumeRatio">--</b></span>
+        </div>
+        <!-- 市盈/市净对场内基金无意义，renderQuote 会整项隐藏并把「市值」改称「规模」 -->
+        <div class="meta-row">
+          <span id="peBox">市盈 <b id="pe">--</b></span>
+          <span id="pbBox">市净 <b id="pb">--</b></span>
+          <span><span id="marketCapLabel">市值</span> <b id="marketCap">--</b></span>
+        </div>
+
+        <!--
+          持仓盈亏。未设成本价时整块隐藏（不占高度），所以放在 quote 末尾，
+          出现与消失都不会把上面的行情数字挤动。
+          金额那行只在填了数量时显示，见 renderPosition。
+        -->
+        <div id="posBox" class="pos-box hidden">
+          <div class="pos-row">
+            <span class="pos-label">持仓</span>
+            <span id="posCost" class="pos-cost">--</span>
+            <span id="posPct" class="pos-pct">--</span>
+          </div>
+          <div id="posAmountRow" class="pos-row">
+            <span id="posProfit" class="pos-profit">--</span>
+            <span id="posValue" class="pos-value">--</span>
+          </div>
+        </div>
+
+        <!--
+          已实现盈亏（来自交易流水）。只在记了流水时出现，与上面的「持仓」
+          （浮动盈亏）并列 —— 一个是还没卖的账面盈亏，一个是已经落袋的。
+
+          口径：加权平均成本法，不含手续费/印花税/过户费。说明在 title 里，
+          见 renderer/trades.js 的 renderRealizedRow。
+        -->
+        <div id="realizedRow" class="realized-row hidden"></div>
+      </section>
+
+      <!-- 走势图：分时 / 日K / 周K -->
+      <section class="chart-box collapsible">
+        <div class="section-bar">
+          <div class="tabs no-drag" role="tablist" aria-label="走势周期">
+            <button id="tabMinute" class="tab active" type="button" role="tab" data-view="minute" aria-selected="true">分时</button>
+            <button id="tabDay5" class="tab" type="button" role="tab" data-view="day5" aria-selected="false">5日</button>
+            <button id="tabMin60" class="tab" type="button" role="tab" data-view="min60" aria-selected="false">60分</button>
+            <button id="tabDay" class="tab" type="button" role="tab" data-view="day" aria-selected="false">日K</button>
+            <button id="tabWeek" class="tab" type="button" role="tab" data-view="week" aria-selected="false">周K</button>
+          </div>
+          <span id="chartHint" class="section-hint"></span>
+        </div>
+        <canvas id="chart" class="chart"></canvas>
+        <div id="chartEmpty" class="chart-empty hidden">暂无分时数据</div>
+        <div id="maLegend" class="ma-legend hidden"></div>
+      </section>
+
+      <!--
+        可滚动区：五个分组 + 资讯区。
+
+        包一层而不是直接给 .card 开 overflow:auto —— 整卡滚动会把标题栏
+        （-webkit-app-region: drag 的拖拽区）一起滚走，无边框窗口就没法拖了。
+        窗口高度会随分组开合自动调整（见 syncWindowHeight），但全部展开需要
+        约 1500px，超过多数屏幕的工作区高度，所以仍要能滚。
+      -->
+      <div class="scroll-area collapsible" id="scrollArea">
+      <!-- 技术指标：默认收起，展开时才请求 -->
+      <section class="collapsible group" id="indicatorGroup" data-section="indicators">
+        <div class="section-bar group-bar no-drag" role="button" tabindex="0"
+             aria-expanded="false" aria-controls="indicatorBody">
+          <span class="section-title">
+            <span class="group-caret" aria-hidden="true">▸</span>
+            技术指标
+          </span>
+          <span id="indicatorHint" class="section-hint"></span>
+        </div>
+        <div id="indicatorBody" class="group-body hidden">
+          <div id="indicatorGrid" class="ind-grid"></div>
+        </div>
+      </section>
+
+      <!-- 资金流向：默认收起，展开时才请求 -->
+      <section class="collapsible group" id="flowGroup" data-section="flow">
+        <div class="section-bar group-bar no-drag" role="button" tabindex="0"
+             aria-expanded="false" aria-controls="flowBody">
+          <span class="section-title">
+            <span class="group-caret" aria-hidden="true">▸</span>
+            资金流向
+          </span>
+          <span id="flowHint" class="section-hint"></span>
+        </div>
+        <div id="flowBody" class="group-body hidden">
+          <div id="flowGrid" class="flow-grid"></div>
+          <div id="flowBars" class="flow-bars"></div>
+        </div>
+      </section>
+
+      <!--
+        融资融券：默认收起。与资金流向是互补口径 —— 那个是当日按委托金额分档，
+        这个是杠杆资金余额的逐日变化，所以两块并列而不是合成一个。
+      -->
+      <section class="collapsible group" id="marginGroup" data-section="margin">
+        <div class="section-bar group-bar no-drag" role="button" tabindex="0"
+             aria-expanded="false" aria-controls="marginBody">
+          <span class="section-title">
+            <span class="group-caret" aria-hidden="true">▸</span>
+            融资融券
+          </span>
+          <span id="marginHint" class="section-hint"></span>
+        </div>
+        <div id="marginBody" class="group-body hidden">
+          <div id="marginGrid" class="flow-grid"></div>
+          <div id="marginBars" class="flow-bars"></div>
+        </div>
+      </section>
+
+      <!-- 财务指标：默认收起。基金与指数无此数据，渲染层会说明 -->
+      <section class="collapsible group" id="financeGroup" data-section="finance">
+        <div class="section-bar group-bar no-drag" role="button" tabindex="0"
+             aria-expanded="false" aria-controls="financeBody">
+          <span class="section-title">
+            <span class="group-caret" aria-hidden="true">▸</span>
+            财务指标
+          </span>
+          <span id="financeHint" class="section-hint"></span>
+        </div>
+        <div id="financeBody" class="group-body hidden">
+          <div id="financeGrid" class="ind-grid"></div>
+        </div>
+      </section>
+
+      <!--
+        交易记录：默认收起。展开后是一条时间线（「什么时候加的仓」），
+        每笔带日期、方向、成交与已实现盈亏。
+
+        与上面几个分组不同，这块的数据源是本地文件（trades.json）而非行情接口，
+        所以它不受轮询驱动，只在切股票与增删流水后重新读取。
+      -->
+      <section class="collapsible group" id="tradeGroup" data-section="trades">
+        <div class="section-bar group-bar no-drag" role="button" tabindex="0"
+             aria-expanded="false" aria-controls="tradeBody">
+          <span class="section-title">
+            <span class="group-caret" aria-hidden="true">▸</span>
+            交易记录
+          </span>
+          <span id="tradeHint" class="section-hint"></span>
+        </div>
+        <div id="tradeBody" class="group-body hidden">
+          <div id="tradeList" class="trade-list"></div>
+        </div>
+      </section>
+
+      <!-- 龙虎榜：默认收起。多数股票长期不上榜，属正常 -->
+      <section class="collapsible group" id="lhbGroup" data-section="lhb">
+        <div class="section-bar group-bar no-drag" role="button" tabindex="0"
+             aria-expanded="false" aria-controls="lhbBody">
+          <span class="section-title">
+            <span class="group-caret" aria-hidden="true">▸</span>
+            龙虎榜
+          </span>
+          <span id="lhbHint" class="section-hint"></span>
+        </div>
+        <div id="lhbBody" class="group-body hidden">
+          <div id="lhbList" class="lhb-list"></div>
+        </div>
+      </section>
+
+      <!--
+        新闻、公告、研报合并成一条时间线（按发布时间倒序穿插），靠右侧的标签
+        区分来源。之前是新闻/研报两个标签页切换查看，现在合并显示后
+        用筛选 chip 代替 ——「全部」默认，也可以只看某一类。
+      -->
+      <section class="news-box collapsible">
+        <div class="section-bar">
+          <div class="tabs no-drag" role="radiogroup" aria-label="资讯筛选">
+            <button id="filterAll" class="tab active" type="button" role="radio"
+                    data-filter="all" aria-checked="true">全部</button>
+            <button id="filterNews" class="tab" type="button" role="radio"
+                    data-filter="news" aria-checked="false">新闻</button>
+            <button id="filterReports" class="tab" type="button" role="radio"
+                    data-filter="reports" aria-checked="false">研报</button>
+          </div>
+          <span class="section-hint">
+            <span id="newsCount"></span>
+            <button id="btnTodayOnly" class="chip no-drag" type="button" title="切换：只看今日 / 看近期">近期</button>
+          </span>
+        </div>
+        <div id="feedList" class="news-list"></div>
+      </section>
+      </div>
+      <!-- /scroll-area -->
+
+      <!-- 状态条 -->
+      <footer class="status collapsible">
+        <span id="phase" class="phase"></span>
+        <span id="statusMsg" class="status-msg"></span>
+        <span id="updated" class="updated"></span>
+      </footer>
+    </div>
+
+    <!-- 设置面板 -->
+    <div id="settings" class="settings hidden">
+      <div class="settings-head drag">
+        <span>设置</span>
+        <button id="btnSettingsClose" class="icon-btn no-drag" type="button" title="关闭">✕</button>
+      </div>
+
+      <div class="settings-body">
+        <div class="field">
+          <label for="searchInput">添加股票 / 基金</label>
+          <div class="search-row">
+            <input id="searchInput" type="text" placeholder="代码 / 名称 / 拼音，如 600519、茅台、510300、黄金ETF" autocomplete="off" />
+          </div>
+          <div id="searchResults" class="search-results"></div>
+        </div>
+
+        <div class="field">
+          <label>关注列表 <span class="hint">拖动排序，✕ 移除</span></label>
+          <div id="watchEditor" class="watch-editor"></div>
+        </div>
+
+        <!--
+          交易流水编辑。只编辑**当前选中**那只股票的流水，不做「所有股票的流水」
+          总表 —— 340px 宽里放不下「股票 + 日期 + 方向 + 价格 + 数量」五列。
+          切股票由上面的关注列表或主界面完成，这里跟着当前选中走。
+
+          记了流水后，上面关注列表里手填的成本价/数量会被忽略（流水推导优先），
+          holdingHint 会把这件事说出来 —— 否则用户改了输入框发现盈亏没变会以为是 bug。
+        -->
+        <div class="field">
+          <label>
+            交易流水
+            <span id="tradeStockLabel" class="hint"></span>
+          </label>
+          <div id="holdingHint" class="hint"></div>
+          <div id="tradeEditor" class="trade-editor"></div>
+          <!-- 四格输入 + 添加。日期默认填今天，最常见的情形是「刚成交，记一笔」 -->
+          <div class="trade-add-row">
+            <input id="tradeDate" type="text" placeholder="YYYY-MM-DD" title="成交日期" />
+            <select id="tradeSide" title="买入 / 卖出">
+              <option value="buy">买</option>
+              <option value="sell">卖</option>
+            </select>
+            <input id="tradePrice" type="text" placeholder="价格" title="成交价" />
+            <input id="tradeShares" type="text" placeholder="数量" title="成交数量（股/份）" />
+            <button id="btnAddTrade" class="chip no-drag" type="button" title="添加这笔流水">＋</button>
+          </div>
+          <div id="tradeMsg" class="hint"></div>
+        </div>
+
+        <div class="field-row">
+          <div class="field">
+            <label for="refreshMs">刷新间隔</label>
+            <select id="refreshMs">
+              <option value="0">自动（按交易时段）</option>
+              <option value="2000">2 秒</option>
+              <option value="3000">3 秒</option>
+              <option value="5000">5 秒</option>
+              <option value="10000">10 秒</option>
+              <option value="30000">30 秒</option>
+              <option value="60000">60 秒</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="newsLimit">新闻条数</label>
+            <select id="newsLimit">
+              <option value="10">10</option>
+              <option value="20">20</option>
+              <option value="30">30</option>
+              <option value="50">50</option>
+              <option value="100">100</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="field">
+          <label for="opacity">窗口不透明度 <span id="opacityVal" class="hint"></span></label>
+          <input id="opacity" type="range" min="0.3" max="1" step="0.05" />
+        </div>
+
+        <label class="check">
+          <input id="includeAnnouncements" type="checkbox" />
+          <span>新闻里混入公司公告（东方财富）</span>
+        </label>
+        <label class="check">
+          <input id="todayOnly" type="checkbox" />
+          <span>默认只看当日新闻</span>
+        </label>
+        <!--
+          价格预警。触发时弹系统通知，每条规则每天最多提醒一次。
+
+          形态是「一行一条规则的紧凑摘要 + 底部一个四格输入行」，
+          刻意不做「每只股票展开三类各两个方向的输入框」——
+          那在 340px 里是一面输入框的墙。
+        -->
+        <div class="field">
+          <label>
+            价格预警
+            <span id="alertStatus" class="hint"></span>
+          </label>
+          <label class="check">
+            <input id="alertsEnabled" type="checkbox" />
+            <span>启用预警通知</span>
+          </label>
+          <div id="ruleEditor" class="rule-editor"></div>
+          <div class="rule-add-row">
+            <select id="ruleCode" title="对哪只股票"></select>
+            <select id="ruleKind" title="触发条件的类型">
+              <option value="changePct">涨跌幅</option>
+              <option value="price">价格</option>
+              <option value="profitPct">持仓盈亏</option>
+            </select>
+            <select id="ruleDir" title="方向">
+              <option value="gte">≥</option>
+              <option value="lte">≤</option>
+            </select>
+            <input id="ruleValue" type="text" placeholder="阈值" title="涨跌幅与盈亏填百分数，价格填价格" />
+            <button id="btnAddRule" class="chip no-drag" type="button" title="添加这条规则">＋</button>
+          </div>
+          <div id="alertMsg" class="hint"></div>
+          <div class="rule-actions">
+            <button id="btnTestAlert" class="chip no-drag" type="button"
+                    title="发一条测试通知，确认系统没有把通知吞掉">测试通知</button>
+            <button id="btnResetAlertState" class="chip no-drag" type="button"
+                    title="清空「今天已提醒过」的记录，让规则重新可以触发">重置提醒记录</button>
+          </div>
+          <div class="hint">改动阈值算作新规则，当天可以再提醒一次</div>
+        </div>
+
+        <div class="field">
+          <label for="startMode">启动时的窗口模式</label>
+          <select id="startMode">
+            <option value="expanded">完整（行情 + 走势图 + 资讯）</option>
+            <option value="list">列表（多股同屏，只看价格与涨跌幅）</option>
+            <option value="collapsed">单行（仅当前股票的价格与涨跌幅）</option>
+          </select>
+        </div>
+        <div class="hint">切换模式：双击标题栏、Ctrl+M，或右键菜单 / 托盘菜单</div>
+        <!--
+          列表模式一旦手动拖过尺寸，高度就完全由用户说了算（加减股票不再自动
+          调整）。这个按钮是那个决定的回退路径 —— 没有它的话「拖过」是不可逆的。
+          仅在真的拖过时才显示，见 syncListSizeReset。
+        -->
+        <div id="listSizeRow" class="hint hidden">
+          <span>列表模式当前用你手动设的高度</span>
+          <button id="btnResetListSize" class="chip no-drag" type="button"
+                  title="改回按关注股票数量自动定高">恢复自动</button>
+        </div>
+      </div>
+
+      <div class="settings-foot">
+        <span id="settingsMsg" class="settings-msg"></span>
+        <button id="btnSave" class="primary no-drag" type="button">保存</button>
+      </div>
+    </div>
+
+    <!-- axis.js 提供刻度几何，必须先于 chart.js / candle.js 加载 -->
+    <script src="axis.js"></script>
+    <script src="chart.js"></script>
+    <script src="candle.js"></script>
+    <script src="indchart.js"></script>
+    <script src="groups.js"></script>
+    <script src="listview.js"></script>
+    <script src="trades.js"></script>
+    <script src="alerts.js"></script>
+    <script src="renderer.js"></script>
+  </body>
+</html>
