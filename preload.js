@@ -47,6 +47,14 @@ contextBridge.exposeInMainWorld('api', {
   resetListHeight: () => ipcRenderer.invoke('reset-list-height'),
   // 窗口高度自适应：渲染层报内容所需高度，主进程决定实际尺寸（仅展开态）
   setAutoHeight: (needed) => ipcRenderer.invoke('set-auto-height', needed),
+  /**
+   * 边缘吸附 / 自动隐藏。
+   *
+   * 吸附与隐藏全在主进程做（只改窗口位置，不改尺寸），渲染层不参与几何计算 ——
+   * 它只需要报一件事：设置面板开着，别把我藏走。
+   */
+  setSettingsOpen: (open) => ipcRenderer.invoke('set-settings-open', open),
+  getSnapState: () => ipcRenderer.invoke('get-snap-state'),
   // 主进程右键菜单推送
   onRefresh: (cb) => ipcRenderer.on('refresh', () => cb()),
   onOpenSettings: (cb) => ipcRenderer.on('open-settings', () => cb()),

@@ -2132,6 +2132,7 @@ async function openSettings() {
   $('opacityVal').textContent = `${Math.round((cfg.opacity != null ? cfg.opacity : 1) * 100)}%`;
   $('includeAnnouncements').checked = cfg.includeAnnouncements !== false;
   $('todayOnly').checked = cfg.todayOnly === true;
+  $('autoHide').checked = cfg.autoHide === true;
   // 下拉读的是「配置里存的模式」。此刻窗口一定是展开的（开面板前会先切过去），
   // 所以不能用 state.mode
   $('startMode').value = cfg.mode || 'expanded';
@@ -2146,6 +2147,9 @@ async function openSettings() {
   renderWatchEditor();
   await Promise.all([refreshTradeEditor(), refreshAlertEditor()]);
   $('settings').classList.remove('hidden');
+  // 面板开着期间不要被自动隐藏卷走：用户的手在键盘上，鼠标很可能已经不在窗口里，
+  // 窗口滑出屏幕会把他敲了一半的代码和成本价一起带走
+  window.api.setSettingsOpen(true);
   $('searchInput').focus();
 }
 
@@ -2376,7 +2380,15 @@ async function navigateFromAlert(code) {
 }
 
 function closeSettings() {
+  const wasOpen = !$('settings').classList.contains('hidden');
   $('settings').classList.add('hidden');
+  /**
+   * 只在真的开着时才报。
+   *
+   * applyMode 每次切到非展开态都会无条件调 closeSettings（省掉一次判断），
+   * 不加这个判断的话每次切模式都会发一次多余的 IPC。
+   */
+  if (wasOpen) window.api.setSettingsOpen(false);
 }
 
 function renderWatchEditor() {
@@ -2599,6 +2611,7 @@ async function saveSettings() {
     opacity: Number($('opacity').value) || 1,
     includeAnnouncements: $('includeAnnouncements').checked,
     todayOnly: $('todayOnly').checked,
+    autoHide: $('autoHide').checked,
     mode: $('startMode').value,
   };
 
@@ -2930,6 +2943,26 @@ function bindEvents() {
 
   $('opacity').addEventListener('input', (e) => {
     $('opacityVal').textContent = `${Math.round(Number(e.target.value) * 100)}%`;
+  });
+
+  /**
+   * 自动隐藏即时生效，不等「保存」。
+   *
+   * 与其他设置项不同的理由：勾了之后用户会立刻想试试（把鼠标移开看它会不会滑走），
+   * 而其他项（新闻条数、透明度）改完看不出什么，攒到保存再一起生效没问题。
+   * 用 patchConfig 而不是 saveConfig —— 面板里其他字段可能正编辑到一半，
+   * 整体保存会把半成品写进配置。
+   */
+  $('autoHide').addEventListener('change', async (e) => {
+    const on = e.target.checked;
+    const res = await window.api.patchConfig({ autoHide: on });
+    if (!res.ok) {
+      $('settingsMsg').textContent = `设置失败：${res.error}`;
+      // 写不进去就把勾选状态改回来，别让界面显示一个没生效的状态
+      e.target.checked = !on;
+      return;
+    }
+    state.config = res.data;
   });
 
   // Esc 关面板；F5 / Ctrl+R 刷新

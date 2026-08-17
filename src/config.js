@@ -36,6 +36,16 @@ const DEFAULTS = {
   todayOnly: false,
   /** 窗口透明度 0.3~1 */
   opacity: 1,
+  /**
+   * 贴边后自动隐藏到屏幕边缘（鼠标碰边缘再滑出来）。
+   *
+   * 默认**关**。吸附本身（拖到边上自动对齐）是无条件的，那个只是让窗口摆得整齐；
+   * 而自动隐藏会让窗口主动从视野里消失 —— 没预期到的用户会以为挂件崩了或被
+   * 误关了，而它又没有任务栏入口可确认。这种「行为惊人」的能力该由用户显式开启。
+   *
+   * 几何与触发条件见 src/edgeSnap.js。
+   */
+  autoHide: false,
   /** 窗口位置与尺寸，退出时记住。非展开态下高度存的仍是**展开**高度 */
   bounds: null,
   /**
@@ -210,6 +220,11 @@ function normalizeConfig(raw) {
       typeof cfg.includeAnnouncements === 'boolean' ? cfg.includeAnnouncements : DEFAULTS.includeAnnouncements,
     todayOnly: typeof cfg.todayOnly === 'boolean' ? cfg.todayOnly : DEFAULTS.todayOnly,
     opacity: clampNumber(cfg.opacity, 0.3, 1, DEFAULTS.opacity),
+    /**
+     * 只认严格的布尔。手改过的配置里可能是字符串 'false'，当真值处理会让
+     * 窗口莫名开始自己往屏幕外躲 —— 而用户并不知道这个功能存在，无从排查
+     */
+    autoHide: typeof cfg.autoHide === 'boolean' ? cfg.autoHide : DEFAULTS.autoHide,
     bounds: normalizeBounds(cfg.bounds),
     /**
      * 列表态高度。下限用 windowLayout.LIST_MIN_H 那套语义（一行的高度），

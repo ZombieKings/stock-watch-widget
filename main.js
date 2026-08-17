@@ -26,6 +26,7 @@ const { realizedInRange } = require('./src/trades');
 const { createAlertStore } = require('./src/alertStore');
 const { evaluateAlerts, pruneFired } = require('./src/alertRules');
 const layout = require('./src/windowLayout');
+const edge = require('./src/edgeSnap');
 
 let win = null;
 let store = null;
@@ -90,6 +91,59 @@ let lastRowCount = 0;
 
 const { WIN_W, MIN_W, MIN_H, COLLAPSED_H } = layout;
 
+/**
+ * 位置/尺寸变动后落盘，下次启动复原。
+ *
+ * 非展开态下当前高度不是展开高度（折叠是 40，列表是按行数算的），不能原样写进
+ * 配置，否则展开高度就被冲掉了——boundsToPersist 负责保住它。
+ *
+ * 模块级函数而不是 createWindow 里的闭包：边缘吸附对齐后要显式调它一次
+ * （见 updateSnap 末尾），那时不在 createWindow 的作用域里。
+ *
+ * @param {object} [rect] 要落盘的矩形。省略时取窗口当前位置。吸附对齐传显式值 ——
+ *        那一刻 setBounds 才刚发出，getBounds 可能还是旧值
+ */
+function persistBounds(rect) {
+  if (!win || win.isDestroyed()) return;
+  // 自动调高引起的尺寸变化不落盘：配置里的 height 是「用户手动拖到多高」，
+  // 它同时是自动调整的下限，被自动值覆盖后收起分组就回不到用户的高度了
+  if (autoResizing) return;
+  /**
+   * 吸附/隐藏动画期间的位置不落盘 —— 这是整个边缘隐藏功能里最要紧的一条。
+   *
+   * 隐藏动画每帧都 setBounds，每帧都触发 moved。照常落盘会把「只露 6px」
+   * 的屏幕外位置写进配置，下次启动窗口就开在屏幕外；而它是 frame:false +
+   * skipTaskbar 的窗口，任务栏上没有入口，用户只能去删 config.json。
+   *
+   * snap.hidden 也要挡：藏着的时候收到的 moved 一定来自我们自己。
+   *
+   * 显式传 rect 的调用绕过这两道闸（那是吸附对齐后的**显示态**位置，
+   * 正是该记住的东西），所以只在没传 rect 时才检查。
+   */
+  if (rect == null && (snap.moving || snap.hidden)) return;
+  try {
+    const current = edge.toRect(rect) || win.getBounds();
+    const patch = {
+      bounds: layout.boundsToPersist({ current, stored: store.load().bounds, mode }),
+    };
+    /**
+     * 列表态下手动拖的高度记进独立字段。
+     *
+     * 一旦记上，listHeight 就成了列表态的权威高度 —— 自动定高（按行数）
+     * 彻底让位，加减股票不再改变窗口尺寸。这是用户明确要求的语义：
+     * 「你设成多高就一直是多高」。
+     *
+     * autoResizing 已经在上面挡掉了程序化调整，所以走到这里的一定是
+     * 用户真的拖过边框（或吸附对齐 —— 那只改位置，不改高度）。
+     */
+    const lh = layout.listHeightToPersist({ current, mode });
+    if (lh != null) patch.listHeight = lh;
+    store.patch(patch);
+  } catch {
+    // 落盘失败不影响使用，静默跳过
+  }
+}
+
 function createWindow() {
   const cfg = store.load();
   const { width: screenW } = screen.getPrimaryDisplay().workAreaSize;
@@ -117,8 +171,21 @@ function createWindow() {
 
   const minSize = layout.minSizeForMode(mode);
 
+  /**
+   * 开窗前把位置拉回屏幕内。
+   *
+   * persistBounds 会挡住隐藏位置落盘，但这里仍要兜一层：配置可能是旧版本写的、
+   * 用户手改过的，或者上次贴的那块副屏已经拔掉了。窗口是 frame:false +
+   * skipTaskbar 的，一旦开在屏幕外就没有任何入口能把它拖回来 —— 这是唯一
+   * 必须靠自愈解决的失效模式，其余的（吸附不生效、隐藏不触发）都还留着出路。
+   *
+   * ensureVisible 只在露出不足时才改，位置正常的话原样返回。
+   */
+  const safeBounds =
+    edge.ensureVisible({ bounds, workArea: workAreaFor(bounds) }) || bounds;
+
   win = new BrowserWindow({
-    ...bounds,
+    ...safeBounds,
     // 非展开态的最小高度必须放开：minHeight 还是 360 时构造函数里的 height=40
     // （或列表模式的 116）会被静默夹回 360，窗口开出来就是展开尺寸
     minWidth: minSize.minWidth,
@@ -152,38 +219,38 @@ function createWindow() {
     console.error('[renderer] 进程异常退出:', details.reason);
   });
 
-  // 位置/尺寸变动后落盘，下次启动复原。
-  // 非展开态下当前高度不是展开高度（折叠是 40，列表是按行数算的），不能原样写进
-  // 配置，否则展开高度就被冲掉了——boundsToPersist 负责保住它
-  const persistBounds = () => {
-    if (!win || win.isDestroyed()) return;
-    // 自动调高引起的尺寸变化不落盘：配置里的 height 是「用户手动拖到多高」，
-    // 它同时是自动调整的下限，被自动值覆盖后收起分组就回不到用户的高度了
-    if (autoResizing) return;
-    try {
-      const current = win.getBounds();
-      const patch = {
-        bounds: layout.boundsToPersist({ current, stored: store.load().bounds, mode }),
-      };
-      /**
-       * 列表态下手动拖的高度记进独立字段。
-       *
-       * 一旦记上，listHeight 就成了列表态的权威高度 —— 自动定高（按行数）
-       * 彻底让位，加减股票不再改变窗口尺寸。这是用户明确要求的语义：
-       * 「你设成多高就一直是多高」。
-       *
-       * autoResizing 已经在上面挡掉了程序化调整，所以走到这里的一定是
-       * 用户真的拖过边框。
-       */
-      const lh = layout.listHeightToPersist({ current, mode });
-      if (lh != null) patch.listHeight = lh;
-      store.patch(patch);
-    } catch {
-      // 落盘失败不影响使用，静默跳过
-    }
-  };
   win.on('moved', persistBounds);
   win.on('resized', persistBounds);
+
+  /**
+   * 拖完窗口后判吸附。
+   *
+   * 用 'moved' 而不是 'move'：后者在拖动过程中连续触发，每一帧都去 setBounds
+   * 对齐会跟用户的拖动打架（窗口被反复拽回边上，拖不走）。'moved' 在松手后才来。
+   *
+   * resized 也要判：从边上把窗口拉宽会改变它离另一条边的距离，
+   * 而且贴右边时改宽度必须重新对齐，否则右边框会离开屏幕边缘。
+   */
+  win.on('moved', updateSnap);
+  win.on('resized', updateSnap);
+
+  // 藏进托盘时停掉轮询：看不见的窗口不需要滑动，也别白烧 CPU。
+  // 唤回时若还贴着边就重新开始
+  win.on('hide', () => {
+    clearSnapTimers();
+    clearInterval(snap.pollTimer);
+    snap.pollTimer = null;
+  });
+  win.on('show', () => {
+    // 藏在屏幕外时被托盘唤回：先放回显示位置，否则用户点了「显示窗口」
+    // 却什么都没看见（窗口确实 visible，只是在屏幕外）
+    if (snap.hidden && snap.shown) {
+      snap.hidden = false;
+      applyBounds(snap.shown);
+    }
+    snap.graceUntil = Date.now() + edge.GRACE_MS;
+    updateSnap();
+  });
 
   win.webContents.on('context-menu', () => {
     const menu = Menu.buildFromTemplate([
@@ -198,6 +265,16 @@ function createWindow() {
     ]);
     menu.popup({ window: win });
   });
+
+  /**
+   * 启动时若已经贴着边，直接进入吸附态（不必等用户拖一次）。
+   *
+   * 宽限期从这里开始计：上次退出时贴着边的话，此刻 updateSnap 会立刻判定为
+   * 吸附并开始轮询；光标不在窗口上时 700ms 后就滑走了 —— 用户看到的是
+   * 「双击图标，闪一下就没了」，十成会当成启动失败。
+   */
+  snap.graceUntil = Date.now() + edge.GRACE_MS;
+  updateSnap();
 }
 
 /** 三种模式的菜单项。右键菜单与托盘菜单共用 */
@@ -370,8 +447,335 @@ function setMode(next, rowCount) {
   // 渲染层据此切换 DOM（三套互斥的布局）
   win.webContents.send('mode-changed', mode);
   refreshTrayMenu();
+
+  /**
+   * 切模式改的是高度，贴边的窗口要重新对齐 —— 尤其是贴顶部时：折叠成 40px
+   * 后隐藏位置只需上移 34px，用旧的 shown（580 高）算出来的位置会把窗口
+   * 送到屏幕外 500 多像素。
+   *
+   * setMode 里的 setBounds 不带 snap.moving 标记，所以它触发的 resized 已经
+   * 会调一次 updateSnap；但 setResizable 之后再显式调一次更稳 —— 上面那次
+   * 若因 autoResizing 被挡掉（saveSettings 路径下有可能），这里补上。
+   */
+  updateSnap();
   return { mode };
 }
+
+// —— 边缘吸附与自动隐藏 ——
+
+/**
+ * 吸附状态机。几何计算全在 src/edgeSnap.js（可单测），这里只管副作用：
+ * setBounds、定时器、光标轮询。
+ *
+ * 状态组合只有三种合法形态，多余的组合都是 bug：
+ *   edge=null                     未吸附。光标轮询不跑，定时器全空
+ *   edge≠null, hidden=false       贴边显示中。轮询在跑，等鼠标离开
+ *   edge≠null, hidden=true        已藏起来。轮询在跑，等鼠标碰触发带
+ *
+ * shown 是**显示态**的矩形，是这套机制的锚：藏起来时用它算触发带、唤回时回到它。
+ * 它只在「吸附完成」和「用户拖动窗口」时更新 —— 隐藏动画期间的中间位置绝不能
+ * 写进去，否则窗口会一格一格往屏幕外爬，再也回不来。
+ */
+const snap = {
+  /** 当前吸附在哪条边。null = 未吸附 */
+  edge: null,
+  /** 显示态矩形（吸附对齐后的位置） */
+  shown: null,
+  /** 是否已经藏起来 */
+  hidden: false,
+  /** 光标轮询定时器 */
+  pollTimer: null,
+  /** 「鼠标离开后延迟隐藏」的定时器 */
+  hideTimer: null,
+  /** 滑动动画的定时器 */
+  animTimer: null,
+  /**
+   * 程序化移动窗口中。与 autoResizing 同样的用途与理由（见那边的注释）：
+   * 隐藏动画每帧都 setBounds，每帧都会触发 moved，照常落盘就把屏幕外的位置
+   * 写进配置了 —— 下次启动窗口开在屏幕外，而它没有任务栏入口。
+   */
+  moving: false,
+  /** 启动宽限期的截止时间戳。见 edgeSnap.GRACE_MS */
+  graceUntil: 0,
+};
+
+/** 当前是否启用自动隐藏。配置项，默认关 —— 见 config 的 autoHide */
+function autoHideEnabled() {
+  try {
+    return store.load().autoHide === true;
+  } catch {
+    return false;
+  }
+}
+
+/** 窗口所在那块屏的工作区。多显示器下不能用主屏的 */
+function workAreaFor(bounds) {
+  try {
+    return screen.getDisplayMatching(bounds).workArea;
+  } catch {
+    return null;
+  }
+}
+
+function clearSnapTimers() {
+  clearTimeout(snap.hideTimer);
+  clearInterval(snap.animTimer);
+  snap.hideTimer = null;
+  snap.animTimer = null;
+}
+
+/**
+ * 退出吸附态。
+ *
+ * **必须先把窗口移回显示位置**：藏着的时候用户去设置里关掉自动隐藏、或者切了模式，
+ * 直接清状态会留下一个停在屏幕外、再也没有触发带能唤回的窗口。
+ */
+function releaseSnap() {
+  const wasHidden = snap.hidden;
+  const shown = snap.shown;
+  clearSnapTimers();
+  clearInterval(snap.pollTimer);
+  snap.pollTimer = null;
+  snap.edge = null;
+  snap.hidden = false;
+  snap.shown = null;
+  if (wasHidden && shown && win && !win.isDestroyed()) applyBounds(shown);
+}
+
+/**
+ * 程序化设置窗口位置，且不落盘。
+ *
+ * moving 标记的清除放在 setImmediate 里，与 autoResizing 同一个理由：
+ * moved 事件多数情况下同步派发，但不同 Electron 版本上不保证。
+ */
+function applyBounds(rect) {
+  if (!win || win.isDestroyed()) return;
+  const r = edge.toRect(rect);
+  if (!r) return;
+  if (edge.sameRect(r, win.getBounds())) return;
+  snap.moving = true;
+  try {
+    win.setBounds(r);
+  } finally {
+    setImmediate(() => {
+      snap.moving = false;
+    });
+  }
+}
+
+/**
+ * 滑动到目标位置。
+ *
+ * 动画纯粹是观感：一格跳过去会让「窗口消失了」和「窗口崩了」看起来一样。
+ * 定时器而非 requestAnimationFrame —— 主进程里没有 rAF，而 130ms 的位移
+ * 对帧率精度不敏感。
+ *
+ * 新动画开始前先清掉旧的：快速划进划出时两个动画会互相覆盖 setBounds，
+ * 窗口在两个位置间抖动。
+ *
+ * @param {object} to 目标矩形
+ * @param {Function} [done] 动画结束后调用（无论是走完还是被顶掉都不调 —— 被顶掉的
+ *        那次由新动画的 done 负责收尾）
+ */
+function animateTo(to, done) {
+  if (!win || win.isDestroyed()) return;
+  const target = edge.toRect(to);
+  if (!target) return;
+
+  clearInterval(snap.animTimer);
+  snap.animTimer = null;
+
+  const from = win.getBounds();
+  if (edge.sameRect(from, target)) {
+    if (done) done();
+    return;
+  }
+
+  const startedAt = Date.now();
+  snap.animTimer = setInterval(() => {
+    if (!win || win.isDestroyed()) {
+      clearInterval(snap.animTimer);
+      snap.animTimer = null;
+      return;
+    }
+    const t = (Date.now() - startedAt) / edge.ANIM_MS;
+    if (t >= 1) {
+      clearInterval(snap.animTimer);
+      snap.animTimer = null;
+      applyBounds(target);
+      if (done) done();
+      return;
+    }
+    applyBounds(edge.lerpRect(from, target, edge.ease(t)));
+  }, edge.ANIM_STEP_MS);
+}
+
+/** 藏起来。只在贴边显示中且那条边是虚拟桌面外沿时才会走到 */
+function hideToEdge() {
+  if (!win || win.isDestroyed() || !snap.edge || snap.hidden || !snap.shown) return;
+  const wa = workAreaFor(snap.shown);
+  const to = edge.hiddenBounds({ bounds: snap.shown, workArea: wa, edge: snap.edge });
+  if (!to) return;
+  snap.hidden = true;
+  animateTo(to);
+}
+
+/** 滑回显示位置 */
+function revealFromEdge() {
+  if (!win || win.isDestroyed() || !snap.hidden || !snap.shown) return;
+  snap.hidden = false;
+  clearTimeout(snap.hideTimer);
+  snap.hideTimer = null;
+  animateTo(snap.shown);
+}
+
+/**
+ * 光标轮询。
+ *
+ * 用轮询而不是 mouseenter/mouseleave：窗口藏到屏幕外之后渲染层收不到任何鼠标
+ * 事件（那 6px 虽然可见，但 Chromium 的命中测试仍按窗口整体算，而且我们要在
+ * 窗口**之外**的触发带上响应）。setIgnoreMouseEvents + 全屏透明层是另一条路，
+ * 但那要多开一个窗口，成本高得多。
+ *
+ * 150ms × 一次 getCursorScreenPoint 的开销可以忽略，而且只在吸附态才跑。
+ */
+function pollCursor() {
+  if (!win || win.isDestroyed() || !snap.edge || !snap.shown) return;
+  // 拖动中不判：拖着窗口经过边缘时鼠标必然在窗口上，但松手前不该有任何吸附动作
+  if (win.isDestroyed()) return;
+
+  let cursor = null;
+  try {
+    cursor = screen.getCursorScreenPoint();
+  } catch {
+    return;
+  }
+
+  const wa = workAreaFor(snap.shown);
+
+  if (snap.hidden) {
+    const zone = edge.triggerZone({ shown: snap.shown, workArea: wa, edge: snap.edge });
+    if (zone && edge.pointInRect(cursor, zone)) revealFromEdge();
+    return;
+  }
+
+  // 显示中：鼠标离开窗口一段时间后藏起来。
+  // 判定用放宽后的窗口矩形，避免贴边那一列像素上的抖动来回触发
+  const area = edge.expandRect(snap.shown, edge.LEAVE_TOLERANCE);
+  const inside = edge.pointInRect(cursor, area);
+
+  if (inside) {
+    clearTimeout(snap.hideTimer);
+    snap.hideTimer = null;
+    return;
+  }
+
+  // 启动宽限期内不藏：上次退出时贴着边，启动后立刻滑走会像启动失败
+  if (Date.now() < snap.graceUntil) return;
+  // 设置面板开着时不藏 —— 那时用户的手在键盘上，鼠标很可能不在窗口里，
+  // 藏走会把他正在填的表单一起带出屏幕
+  if (settingsOpen) return;
+  if (snap.hideTimer) return;
+  snap.hideTimer = setTimeout(() => {
+    snap.hideTimer = null;
+    hideToEdge();
+  }, edge.HIDE_DELAY_MS);
+}
+
+function startCursorPoll() {
+  if (snap.pollTimer) return;
+  snap.pollTimer = setInterval(pollCursor, edge.POLL_MS);
+}
+
+/**
+ * 窗口移动/尺寸变化后重新判定吸附。
+ *
+ * 由 moved / resized 调用。程序化移动（动画、模式切换的自动调高）必须挡掉，
+ * 否则动画每一帧都会重新判定一次边缘，把中间位置当成新的 shown。
+ */
+function updateSnap() {
+  if (!win || win.isDestroyed()) return;
+  // 藏起来的时候收到 moved 一定是我们自己的动画（用户碰不到屏幕外的窗口），
+  // 重新判定会把屏幕外的位置写进 shown
+  if (snap.moving || snap.hidden || autoResizing) return;
+
+  const bounds = win.getBounds();
+  const wa = workAreaFor(bounds);
+  const want = edge.detectEdge({ bounds, workArea: wa });
+
+  if (!want) {
+    if (snap.edge) releaseSnap();
+    return;
+  }
+
+  const shown = edge.snapBounds({ bounds, workArea: wa, edge: want });
+  if (!shown) return;
+
+  snap.edge = want;
+  snap.shown = shown;
+  snap.hidden = false;
+  clearSnapTimers();
+
+  // 对齐贴边。这是用户能直接看到的那一下「啪」
+  applyBounds(shown);
+  /**
+   * 对齐后的位置要落盘 —— applyBounds 带着 snap.moving 标记，它触发的 moved
+   * 会被 persistBounds 挡掉，不显式记一次的话下次启动会回到用户松手时那个
+   * 差几像素的位置，「贴边」看起来就没生效。
+   *
+   * 传显式矩形而不让它自己 getBounds：setBounds 才刚发出，读回来可能还是旧值。
+   */
+  persistBounds(shown);
+
+  /**
+   * 自动隐藏要同时满足三个条件，缺一个就只吸附不隐藏：
+   *   1. 用户开了这个功能
+   *   2. 那条边确实是虚拟桌面外沿（多屏时往内侧边藏 = 挪到隔壁屏中央）
+   *   3. 窗口是可见的（藏在托盘里时轮询没有意义）
+   */
+  let displays = null;
+  try {
+    displays = screen.getAllDisplays();
+  } catch {
+    displays = null;
+  }
+  const canHide =
+    autoHideEnabled() && edge.isOuterEdge({ shown, workArea: wa, edge: want, displays });
+
+  if (canHide && win.isVisible()) startCursorPoll();
+  else {
+    clearInterval(snap.pollTimer);
+    snap.pollTimer = null;
+  }
+}
+
+/**
+ * 自动隐藏开关变化后重新布置。
+ *
+ * 关掉时要把窗口放回来（releaseSnap 负责），开启时若当前已经贴边就直接开始轮询 ——
+ * 不必让用户再拖一次窗口才生效。
+ */
+function applyAutoHideSetting() {
+  if (!win || win.isDestroyed()) return;
+  if (!autoHideEnabled()) {
+    releaseSnap();
+    return;
+  }
+  // 重新走一遍判定：它会按当前位置决定该不该开轮询
+  const wasHidden = snap.hidden;
+  snap.hidden = false;
+  if (wasHidden && snap.shown) applyBounds(snap.shown);
+  updateSnap();
+}
+
+/**
+ * 设置面板是否开着。
+ *
+ * 只为「面板开着时不自动隐藏」这一件事存在：用户在填表单时手在键盘上，鼠标
+ * 常常已经移出窗口，700ms 后窗口连着半填的表单一起滑出屏幕是很糟的体验。
+ * 渲染层通过 set-settings-open 报过来。
+ */
+let settingsOpen = false;
 
 /** IPC 统一返回 { ok, data?, error? } */
 function ok(data) {
@@ -564,6 +968,9 @@ ipcMain.handle('save-config', (_e, cfg) => {
   try {
     const saved = store.save(cfg);
     if (win && !win.isDestroyed()) win.setOpacity(saved.opacity);
+    // 自动隐藏开关可能刚被改。关掉时 applyAutoHideSetting 会把藏着的窗口放回来 ——
+    // 少了这一步，用户在窗口藏着时关掉这个功能，窗口就永久留在屏幕外了
+    applyAutoHideSetting();
     return ok(saved);
   } catch (err) {
     return fail(err);
@@ -572,7 +979,46 @@ ipcMain.handle('save-config', (_e, cfg) => {
 
 ipcMain.handle('patch-config', (_e, partial) => {
   try {
-    return ok(store.patch(partial));
+    const saved = store.patch(partial);
+    // patch 也可能带 autoHide（设置面板里的勾选是即时生效的）
+    if (partial && typeof partial === 'object' && 'autoHide' in partial) applyAutoHideSetting();
+    return ok(saved);
+  } catch (err) {
+    return fail(err);
+  }
+});
+
+/**
+ * 渲染层报「设置面板开/关」。
+ *
+ * 只为一件事：面板开着时不自动隐藏。用户填表单时手在键盘上，鼠标常常已经移出
+ * 窗口，700ms 后窗口连着半填的表单一起滑出屏幕 —— 而表单里可能有他刚敲了一半
+ * 的股票代码和成本价。
+ *
+ * 状态放在主进程而不是「渲染层自己判断要不要报」：隐藏的决定权在主进程，
+ * 它需要知道这个事实，而不是等渲染层来阻止。
+ */
+ipcMain.handle('set-settings-open', (_e, open) => {
+  try {
+    settingsOpen = open === true;
+    // 关掉面板时，若鼠标已经在窗口外，让它按正常节奏进入隐藏倒计时（轮询会处理）。
+    // 开着面板时把待执行的隐藏取消掉 —— 面板是刚打开的，倒计时可能已经在跑了
+    if (settingsOpen) {
+      clearTimeout(snap.hideTimer);
+      snap.hideTimer = null;
+      // 面板在藏起来的窗口里打开只能来自托盘菜单，先把窗口放回来
+      if (snap.hidden) revealFromEdge();
+    }
+    return ok({ settingsOpen });
+  } catch (err) {
+    return fail(err);
+  }
+});
+
+/** 当前吸附状态。给设置面板显示提示用（「已贴在右边」之类），也便于排查 */
+ipcMain.handle('get-snap-state', () => {
+  try {
+    return ok({ edge: snap.edge, hidden: snap.hidden, autoHide: autoHideEnabled() });
   } catch (err) {
     return fail(err);
   }
@@ -1099,4 +1545,8 @@ app.on('before-quit', () => {
   // 退出过程中不该还在发行情请求
   clearInterval(alertFallbackTimer);
   alertFallbackTimer = null;
+  // 光标轮询与滑动动画同理：quit 过程中还在 setBounds 会碰到已销毁的窗口
+  clearSnapTimers();
+  clearInterval(snap.pollTimer);
+  snap.pollTimer = null;
 });

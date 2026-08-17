@@ -230,6 +230,27 @@ test('布尔项非布尔值时用默认值', () => {
   assert.equal(normalizeConfig({ todayOnly: true }).todayOnly, true);
 });
 
+test('autoHide 默认关，且只认严格布尔', () => {
+  // 默认关：这个功能会让窗口主动从视野里消失，而它没有任务栏入口可确认，
+  // 没预期到的用户会以为挂件崩了
+  assert.equal(normalizeConfig({}).autoHide, false);
+  assert.equal(normalizeConfig(null).autoHide, false);
+  assert.equal(normalizeConfig({ autoHide: true }).autoHide, true);
+  // 手改过的配置里的字符串不能当真值 —— 那会让窗口莫名开始自己往屏幕外躲
+  assert.equal(normalizeConfig({ autoHide: 'false' }).autoHide, false);
+  assert.equal(normalizeConfig({ autoHide: 'true' }).autoHide, false);
+  assert.equal(normalizeConfig({ autoHide: 1 }).autoHide, false);
+});
+
+test('autoHide 能被 patch 单独改，不连带丢掉别的字段', () => {
+  // 与 sections/alerts 不同，autoHide 是标量，浅合并就够；这条盯着它别被漏进
+  // 某个需要深合并的分支里
+  const n = normalizeConfig({ autoHide: true, todayOnly: true, opacity: 0.8 });
+  assert.equal(n.autoHide, true);
+  assert.equal(n.todayOnly, true);
+  assert.equal(n.opacity, 0.8);
+});
+
 test('bounds 字段不全时整体丢弃', () => {
   assert.equal(normalizeConfig({ bounds: { x: 1, y: 2 } }).bounds, null);
   assert.equal(normalizeConfig({ bounds: 'nope' }).bounds, null);
